@@ -193,6 +193,40 @@ def _model_reader_dshape_classdim(args, is_train, sz=224, rsz=352):
             reader = imagenet_demo.val(name="afs_imagenet", cache='/data_cache')
     return None, reader, dshape, class_dim
 
+def lr_linear_decay(boundaries, values):
+    with fluid.default_main_program()._lr_schedule_guard():
+        if len(values) - len(boundaries) != 1:
+            raise ValueError("len(values) - len(boundaries) should be 1")
+        global_step = fluid.layers.learning_rate_scheduler._decay_step_counter()
+
+        lr = fluid.layers.tensor.create_global_var(
+            shape=[1],
+            value=0.0,
+            dtype='float32',
+            persistable=True,
+            name="learning_rate")
+
+        with fluid.layers.control_flow.Switch() as switch:
+            for idx, boundary in enumerate(boundaries):
+                boundary_val = fluid.layers.tensor.fill_constant(
+                    shape=[1],
+                    dtype='float32',
+                    value=float(boundary),
+                    force_cpu=True)
+                value_var = fluid.layers.tensor.fill_constant(
+                    shape=[1], dtype='float32', value=float(values[idx]))
+                with switch.case(global_step < boundary_val):
+                    boundary_start = 0 if idx == 0 else boundaries[idx-1]
+                    schedule_rate = (values[idx+1] - values[idx]) / (boundary - boundary_start)
+                    lr = values[idx] + schedule_rate * (global_step - boundary_start)
+                    fluid.layers.tensor.assign(value_var, lr)
+                
+            last_value_val = fluid.layers.tensor.fill_constant(
+                shape=[1], dtype='float32', value=float(values[-1]))
+            with switch.default():
+                fluid.layers.tensor.assign(last_value_val, lr)
+    return lr
+
 
 def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs):
 
@@ -234,15 +268,16 @@ def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, s
                 total_images = 1281167 / trainer_count
 
                 step = int(total_images / bs + 1)
-                epochs = [30, 60, 90]
-                epochs = [0, 1, 2, 3, 4, 5, 6]
+                epochs = [7, 13]
                 bd = [step * e for e in epochs]
                 base_lr = args.learning_rate
-                lr = []
-                lr = [base_lr * (0.1**i) for i in range(len(bd) + 1)]
+                lr = [base_lr, base_lr * 2, base_lr / 4]
+                #lr = [base_lr * (0.1**i) for i in range(len(bd) + 1)]
+                print("lr linear decay boundaries: ", bd, " values: ", lr)
                 optimizer = fluid.optimizer.Momentum(
-                    learning_rate=fluid.layers.piecewise_decay(
-                        boundaries=bd, values=lr),
+                    learning_rate=lr_linear_decay(boundaries=bd, values=lr),
+                    #learning_rate=fluid.layers.piecewise_decay(
+                    #    boundaries=bd, values=lr),
                     momentum=0.9,
                     regularization=fluid.regularizer.L2Decay(1e-4))
                 optimizer.minimize(avg_cost)

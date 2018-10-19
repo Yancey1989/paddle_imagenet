@@ -208,7 +208,7 @@ def train_parallel(train_args, test_args, args, train_prog, test_prog,
         # program changed
         if pass_id == 0:
             train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=128, rsz=160, bs=224, need_update_start_prog=True)
-        elif pass_id == 7:
+        elif pass_id == 13:
             train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=224, rsz=352, bs=96)
         else:
             pass
