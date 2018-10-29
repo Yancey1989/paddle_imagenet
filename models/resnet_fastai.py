@@ -32,12 +32,9 @@ import paddle.fluid.profiler as profiler
 import datareader
 
 ## visreader for imagenet
-import imagenet_demo
+import torchvision_reader
 
 BN_NO_DECAY = bool(os.getenv("BN_NO_DECAY", "1"))
-
-
-paddle.dataset.common.DATA_HOME = "./thirdparty/data"
 
 train_parameters = {
     "input_size": [3, 224, 224],
@@ -91,20 +88,11 @@ class ResNet():
 
         pool = fluid.layers.pool2d(
             input=conv, pool_size=7, pool_type='avg', global_pooling=True)
-        stdv = 1.0 / math.sqrt(pool.shape[1] * 1.0)
         out = fluid.layers.fc(input=pool,
                               size=class_dim,
                               act='softmax',
                               param_attr=fluid.param_attr.ParamAttr(
                                   initializer=fluid.initializer.NormalInitializer(0.0, 0.01)))
-#                                  initializer=fluid.initializer.Uniform(-stdv,
-#                                                                        stdv)))
-        #out = fluid.layers.fc(input=pool,
-        #                      size=class_dim,
-        #                      act=None,
-        #                      param_attr=fluid.param_attr.ParamAttr(
-        #                          initializer=fluid.initializer.NormalInitializer(0.0, 0.01)))
-
         return out
 
     def conv_bn_layer(self,
@@ -154,86 +142,52 @@ class ResNet():
         return fluid.layers.elementwise_add(x=short, y=conv2, act='relu')
 
 
-def _model_reader_dshape_classdim(args, is_train, sz=224, rsz=352):
-    model = None
+def _model_reader_dshape_classdim(args, is_train, sz=224, rsz=352, min_scale=0.08):
     reader = None
-    if args.data_set == "cifar10":
-        class_dim = 10
-        if args.data_format == 'NCHW':
-            dshape = [3, 32, 32]
-        else:
-            dshape = [32, 32, 3]
-        model = resnet_cifar10
-        if is_train:
-            reader = paddle.dataset.cifar.train10()
-        else:
-            reader = paddle.dataset.cifar.test10()
-    elif args.data_set == "flowers":
-        class_dim = 102
-        if args.data_format == 'NCHW':
-            dshape = [3, 224, 224]
-        else:
-            dshape = [224, 224, 3]
-        model = resnet_imagenet
-        if is_train:
-            reader = paddle.dataset.flowers.train()
-        else:
-            reader = paddle.dataset.flowers.test()
-    elif args.data_set == "imagenet":
+    if args.data_set == "imagenet":
         class_dim = 1000
         if args.data_format == 'NCHW':
             dshape = [3, sz, sz]
         else:
             dshape = [sz, sz, 3]
-        imagenet_demo.g_settings['resize'] = rsz
-        imagenet_demo.g_settings['crop'] = sz 
         if is_train:
-            reader = imagenet_demo.train(name="afs_imagenet", part_id=0, part_num=1, cache='/data_cache')
+            reader = torchvision_reader.train(
+                traindir="/data/imagenet/sz/%d/train" % rsz, sz=sz, min_scale=min_scale, use_uint8_reader=args.use_uint8_reader)
         else:
-            reader = imagenet_demo.val(name="afs_imagenet", cache='/data_cache')
+            reader = torchvision_reader.test(
+                valdir="/data/imagenet/sz/%d/validation" % rsz, bs=32, sz=sz, rect_val=False, use_uint8_reader=args.use_uint8_reader)
+    else:
+        raise ValueError("only support imagenet dataset.")
+
     return None, reader, dshape, class_dim
 
-def lr_linear_decay(boundaries, values):
-    with fluid.default_main_program()._lr_schedule_guard():
-        if len(values) - len(boundaries) != 1:
-            raise ValueError("len(values) - len(boundaries) should be 1")
-        global_step = fluid.layers.learning_rate_scheduler._decay_step_counter()
-
-        lr = fluid.layers.tensor.create_global_var(
-            shape=[1],
-            value=0.0,
-            dtype='float32',
-            persistable=True,
-            name="learning_rate")
-
-        with fluid.layers.control_flow.Switch() as switch:
-            for idx, boundary in enumerate(boundaries):
-                boundary_val = fluid.layers.tensor.fill_constant(
-                    shape=[1],
-                    dtype='float32',
-                    value=float(boundary),
-                    force_cpu=True)
-                value_var = fluid.layers.tensor.fill_constant(
-                    shape=[1], dtype='float32', value=float(values[idx]))
-                with switch.case(global_step < boundary_val):
-                    boundary_start = 0 if idx == 0 else boundaries[idx-1]
-                    schedule_rate = (values[idx+1] - values[idx]) / (boundary - boundary_start)
-                    lr = values[idx] + schedule_rate * (global_step - boundary_start)
-                    fluid.layers.tensor.assign(value_var, lr)
-                
-            last_value_val = fluid.layers.tensor.fill_constant(
-                shape=[1], dtype='float32', value=float(values[-1]))
-            with switch.default():
-                fluid.layers.tensor.assign(last_value_val, lr)
-    return lr
+def lr_decay(lrs, epochs, bs, total_image):
+    boundaries = []
+    values = []
+    import math
+    for idx, epoch in enumerate(epochs):
+        step = math.ceil(total_image * 1.0 / (bs[idx] * 8))
+        step = total_image / (bs[idx] * 8)
+        ratio = (lrs[idx][1] - lrs[idx][0]) / (epoch[1] - epoch[0])
+        lr_base = lrs[idx][0]
+        for s in xrange(epoch[0], epoch[1]):
+            if boundaries:
+                boundaries.append(boundaries[-1] + step)
+            else:
+                boundaries = [step]
+            values.append(lr_base + ratio * (s - epoch[0]))
+    values.append(lrs[-1])
+    return boundaries, values
 
 
-def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs):
+
+def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs, min_scale):
 
     _, reader, dshape, class_dim = _model_reader_dshape_classdim(args,
                                                                  is_train,
                                                                  sz=sz,
-                                                                 rsz=rsz)
+                                                                 rsz=rsz,
+                                                                 min_scale=min_scale)
 
     pyreader = None
     trainer_count = int(os.getenv("PADDLE_TRAINERS_NUM", "1"))
@@ -241,16 +195,31 @@ def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, s
         with fluid.unique_name.guard():
             with fluid.program_guard(main_prog, py_reader_startup_prog):
                 with fluid.unique_name.guard():
+                    if args.use_uint8_reader:
+                        img_dtype = 'uint8'
+                    else:
+                        img_dtype = 'float32'
                     pyreader = fluid.layers.py_reader(
                         capacity=bs * args.gpus,
                         shapes=([-1] + dshape, (-1, 1)),
-                        dtypes=('float32', 'int64'),
+                        dtypes=(img_dtype, 'int64'),
                         name="train_reader_" + str(sz) if is_train else "test_reader_" + str(sz),
                         use_double_buffer=True)
-                    input, label = fluid.layers.read_file(pyreader)
+            input, label = fluid.layers.read_file(pyreader)
+            if args.use_uint8_reader:
+                cast = fluid.layers.cast(input, "float32")
+                img_mean = fluid.layers.create_global_var([3, 1, 1], 0.0, "float32", name="img_mean", persistable=True)
+                img_std = fluid.layers.create_global_var([3, 1, 1], 0.0, "float32", name="img_std", persistable=True)
+                t1 = cast / 255.0 - img_mean
+                t2 = t1 / img_std
+                #t1 = fluid.layers.elementwise_sub(cast / 255.0, img_mean, axis=1)
+                #t2 = fluid.layers.elementwise_div(t1, img_std, axis=1)
+                #t2 = cast / 255.0 - img_std
+            else:
+                t2 = input
 
             model = ResNet(is_train=is_train)
-            predict = model.net(input, class_dim=class_dim)
+            predict = model.net(t2, class_dim=class_dim)
             cost = fluid.layers.cross_entropy(input=predict, label=label)
             avg_cost = fluid.layers.mean(x=cost)
 
@@ -260,24 +229,16 @@ def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, s
             # configure optimize
             optimizer = None
             if is_train:
-                if args.use_lars:
-                    lars_decay = 1.0
-                else:
-                    lars_decay = 0.0
-
                 total_images = 1281167 / trainer_count
 
-                step = int(total_images / bs + 1)
-                epochs = [7, 13]
-                bd = [step * e for e in epochs]
-                base_lr = args.learning_rate
-                lr = [base_lr, base_lr * 2, base_lr / 4]
-                #lr = [base_lr * (0.1**i) for i in range(len(bd) + 1)]
-                print("lr linear decay boundaries: ", bd, " values: ", lr)
+                epochs = [(0,7), (7,13), (13, 22), (22, 25), (25, 28)]
+                bs_epoch = [224, 224, 96, 96, 50]
+                lrs = [(1.0, 2.0), (2.0, 0.25), (0.42857, 0.042857), (0.042857, 0.0042857), (0.00223, 0.000223), 0.000223]
+                boundaries, values = lr_decay(lrs, epochs, bs_epoch, total_images)
+
+                print("lr linear decay boundaries: ", boundaries, " \nvalues: ", values)
                 optimizer = fluid.optimizer.Momentum(
-                    learning_rate=lr_linear_decay(boundaries=bd, values=lr),
-                    #learning_rate=fluid.layers.piecewise_decay(
-                    #    boundaries=bd, values=lr),
+                    learning_rate=fluid.layers.piecewise_decay(boundaries=boundaries, values=values),
                     momentum=0.9,
                     regularization=fluid.regularizer.L2Decay(1e-4))
                 optimizer.minimize(avg_cost)
@@ -287,11 +248,7 @@ def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, s
 
     # config readers
     batched_reader = None
-    pyreader.decorate_paddle_reader(
-        paddle.batch(
-            reader if args.no_random else paddle.reader.shuffle(
-                reader, buf_size=5120),
-            batch_size=bs))
+    pyreader.decorate_paddle_reader(paddle.batch(reader, batch_size=bs))
 
     return avg_cost, optimizer, [batch_acc1,
                                  batch_acc5], batched_reader, pyreader, py_reader_startup_prog

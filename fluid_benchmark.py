@@ -26,114 +26,38 @@ import paddle.fluid.profiler as profiler
 import paddle.fluid.transpiler.distribute_transpiler as distribute_transpiler
 
 from args import *
+import torchvision_reader
 
 DEBUG_PROG = bool(os.getenv("DEBUG_PROG", "0"))
 
-def append_nccl2_prepare(trainer_id, startup_prog):
-    if trainer_id >= 0:
-        # append gen_nccl_id at the end of startup program
-        trainer_id = int(os.getenv("PADDLE_TRAINER_ID"))
-        port = os.getenv("PADDLE_PSERVER_PORT")
-        worker_ips = os.getenv("PADDLE_TRAINER_IPS")
-        worker_endpoints = []
-        for ip in worker_ips.split(","):
-            worker_endpoints.append(':'.join([ip, port]))
-        num_trainers = len(worker_endpoints)
-        current_endpoint = os.getenv("PADDLE_CURRENT_IP") + ":" + port
-        worker_endpoints.remove(current_endpoint)
-
-        nccl_id_var = startup_prog.global_block().create_var(
-            name="NCCLID",
-            persistable=True,
-            type=fluid.core.VarDesc.VarType.RAW)
-        startup_prog.global_block().append_op(
-            type="gen_nccl_id",
-            inputs={},
-            outputs={"NCCLID": nccl_id_var},
-            attrs={
-                "endpoint": current_endpoint,
-                "endpoint_list": worker_endpoints,
-                "trainer_id": trainer_id
-            })
-        return nccl_id_var, num_trainers, trainer_id
-    else:
-        raise Exception("must set positive PADDLE_TRAINER_ID env variables for "
-                        "nccl-based dist train.")
-
-
-def dist_transpile(trainer_id, args, train_prog, startup_prog):
-    if trainer_id < 0:
-        return None, None
-
-    # the port of all pservers, needed by both trainer and pserver
-    port = os.getenv("PADDLE_PSERVER_PORT", "6174")
-    # comma separated ips of all pservers, needed by trainer and
-    # pserver
-    pserver_ips = os.getenv("PADDLE_PSERVER_IPS", "")
-    eplist = []
-    for ip in pserver_ips.split(","):
-        eplist.append(':'.join([ip, port]))
-    pserver_endpoints = ",".join(eplist)
-    # total number of workers/trainers in the job, needed by
-    # trainer and pserver
-    trainers = int(os.getenv("PADDLE_TRAINERS"))
-    # the IP of the local machine, needed by pserver only
-    current_endpoint = os.getenv("PADDLE_CURRENT_IP", "") + ":" + port
-    # the role, should be either PSERVER or TRAINER
-    training_role = os.getenv("PADDLE_TRAINING_ROLE")
-
-    config = distribute_transpiler.DistributeTranspilerConfig()
-    config.slice_var_up = not args.no_split_var
-    t = distribute_transpiler.DistributeTranspiler(config=config)
-    t.transpile(
-        trainer_id,
-        # NOTE: *MUST* use train_prog, for we are using with guard to
-        # generate different program for train and test.
-        program=train_prog,
-        pservers=pserver_endpoints,
-        trainers=trainers,
-        sync_mode=not args.async_mode,
-        startup_program=startup_prog)
-    if training_role == "PSERVER":
-        pserver_program = t.get_pserver_program(current_endpoint)
-        pserver_startup_program = t.get_startup_program(
-            current_endpoint, pserver_program, startup_program=startup_prog)
-        return pserver_program, pserver_startup_program
-    elif training_role == "TRAINER":
-        train_program = t.get_trainer_program()
-        return train_program, startup_prog
-    else:
-        raise ValueError(
-            'PADDLE_TRAINING_ROLE environment variable must be either TRAINER or PSERVER'
-        )
-
-
-def test_parallel(exe, test_args, args, test_prog, feeder):
+def test_parallel(exe, test_args, args, test_prog, feeder, bs):
     acc_evaluators = []
     for i in xrange(len(test_args[2])):
         acc_evaluators.append(fluid.metrics.Accuracy())
 
     to_fetch = [v.name for v in test_args[2]]
-    if args.use_reader_op:
-        test_args[4].start()
-        while True:
-            try:
-                acc_rets = exe.run(fetch_list=to_fetch)
-                for i, e in enumerate(acc_evaluators):
-                    e.update(
-                        value=np.array(acc_rets[i]), weight=args.batch_size)
-            except fluid.core.EOFException as eof:
-                test_args[4].reset()
-                break
-    else:
-        for batch_id, data in enumerate(test_args[3]()):
-            acc_rets = exe.run(feed=feeder.feed(data), fetch_list=to_fetch)
+    print(to_fetch)
+    test_args[4].start()
+    batch_id = 0
+    start_ts = time.time()
+    while True:
+        try:
+            acc_rets = exe.run(fetch_list=to_fetch)
+            ret_result = [np.mean(np.array(ret)) for ret in acc_rets]
+            print("Test batch: [%d], acc_rets: [%s]" % (batch_id, ret_result))
+            batch_id += 1
             for i, e in enumerate(acc_evaluators):
-                e.update(value=np.array(acc_rets[i]), weight=len(data))
+                e.update(
+                    value=np.array(acc_rets[i]), weight=bs)
+        except fluid.core.EOFException as eof:
+            test_args[4].reset()
+            break
+    num_samples = batch_id * bs * args.gpus 
+    print_train_time(start_ts, time.time(), num_samples)
 
     return [e.eval() for e in acc_evaluators]
 
-def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False):
+def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False, min_scale=0.08):
     print('program changed: epoch: [%d], image size: [%d], resize: [%d], batch_size:[%d]' % (epoch, sz, rsz, bs))
     train_prog = fluid.Program()
     test_prog = fluid.Program()
@@ -142,8 +66,8 @@ def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False):
 
     model_def = __import__("models.%s" % args.model, fromlist=["models"])
 
-    train_args = list(model_def.get_model(args, True, train_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs))
-    test_args = list(model_def.get_model(args, False, test_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs))
+    train_args = list(model_def.get_model(args, True, train_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs, min_scale))
+    test_args = list(model_def.get_model(args, False, test_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs, min_scale))
 
     place = core.CPUPlace() if args.device == 'CPU' else core.CUDAPlace(0)
     startup_exe = fluid.Executor(place)
@@ -153,11 +77,42 @@ def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False):
     if need_update_start_prog:
         print("execute startup program")
         startup_exe.run(startup_prog)
+        if args.init_conv2d_kaiming:
+            import torch
+            conv2d_w_vars = [var for var in startup_prog.global_block().vars.values() if var.name.startswith('conv2d_')]
+            for var in conv2d_w_vars:
+                torch_w = torch.empty(var.shape)
+                print("initialize %s, shape: %s, with kaiming normalization." % (var.name, var.shape))
+                kaiming_np = torch.nn.init.kaiming_normal_(torch_w, mode='fan_out', nonlinearity='relu').numpy()
+                tensor = fluid.global_scope().find_var(var.name).get_tensor()
+                tensor.set(np.array(kaiming_np, dtype='float32'), place)
+        
+        if args.use_uint8_reader:
+            img_mean_np = np.array([0.485, 0.456, 0.406]).astype("float32").reshape((3, 1, 1))
+            img_std_np = np.array([0.229, 0.224, 0.225]).astype("float32").reshape((3, 1, 1))
+            mean_var = fluid.global_scope().find_var("img_mean")
+            mean_var.get_tensor().set(img_mean_np, place)
+            std_var = fluid.global_scope().find_var("img_std")
+            std_var.get_tensor().set(img_std_np, place)
+
 
     if DEBUG_PROG:
         with open('/tmp/train_prog_pass%d' % epoch, 'w') as f: f.write(train_prog.to_string(True))
+        with open('/tmp/test_prog_pass%d' % epoch, 'w') as f: f.write(test_prog.to_string(True))
         with open('/tmp/startup_prog_pass%d' % epoch, 'w') as f: f.write(startup_prog.to_string(True))
         with open('/tmp/py_reader_startup_prog_pass%d' % epoch, 'w') as f: f.write(py_reader_startup_prog.to_string(True))
+        with open('/tmp/train_prog_vars', 'w') as f:
+            for var in train_prog.global_block().vars.values():
+                try:
+                    f.write(var.name + '|' + str(var.shape) + '\n')
+                except Exception,e:
+                    pass
+        with open('/tmp/test_prog_vars', 'w') as f:
+            for var in test_prog.global_block().vars.values():
+                try:
+                    f.write(var.name + '|' + str(var.shape) + '\n')
+                except Exception,e:
+                    pass
 
     strategy = fluid.ExecutionStrategy()
     strategy.num_threads = args.cpus
@@ -177,39 +132,31 @@ def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False):
     test_exe = fluid.ParallelExecutor(
         True, main_program=test_prog, share_vars_from=train_exe)
 
-    
     return train_args, test_args, test_prog, train_exe, test_exe
 
 
 
 # NOTE: only need to benchmark using parallelexe
-def train_parallel(train_args, test_args, args, train_prog, test_prog,
-                   startup_prog, nccl_id_var, num_trainers, trainer_id):
+def train_parallel(args):
     over_all_start = time.time()
-    feeder = None
-    train_prog = fluid.Program()
     test_prog = fluid.Program()
-    startup_prog = fluid.Program()
 
-    if nccl_id_var and trainer_id == 0:
-        #FIXME(wuyi): wait other trainer to start listening
-        time.sleep(30)
-    
-    if args.update_method == "pserver":
-        # parameter server mode distributed training, merge
-        # gradients on local server, do not initialize
-        # ParallelExecutor with multi server all-reduce mode.
-        num_trainers = 1
-        trainer_id = 0
+    trainer_id = 0
     exe = None
     test_exe = None
-
+    bs = 224
+    train_args = None
+    test_args = None
     for pass_id in range(args.pass_num):
         # program changed
         if pass_id == 0:
-            train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=128, rsz=160, bs=224, need_update_start_prog=True)
+            train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=128, rsz=160, bs=bs, need_update_start_prog=True)
         elif pass_id == 13:
-            train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=224, rsz=352, bs=96)
+            bs = 96
+            train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=224, rsz=352, bs=bs, min_scale=0.087)
+        elif pass_id == 25:
+            bs = 50
+            train_args, test_args, test_prog, exe, test_exe = refresh_program(args, pass_id, sz=288, rsz=352, bs=bs, min_scale=0.5)
         else:
             pass
 
@@ -217,21 +164,12 @@ def train_parallel(train_args, test_args, args, train_prog, test_prog,
         num_samples = 0
         iters = 0
         start_time = time.time()
-        if not args.use_reader_op:
-            reader_generator = train_args[3]()  #train_reader
-        batch_id = 0
-        data = None
-        if args.use_reader_op:
-            train_args[4].start()
+        train_args[4].start() # start pyreader
         while True:
-            if not args.use_reader_op and not args.use_fake_data:
-                data = next(reader_generator, None)
-                if data == None:
-                    break
-            if args.profile and batch_id == 99:
+            if args.profile and iters == 99:
                 profiler.start_profiler("All")
                 profiler.reset_profiler()
-            elif args.profile and batch_id == 200:
+            elif args.profile and iters == 200:
                 print("profiling total time: ", time.time() - start_time)
                 profiler.stop_profiler("total", "/tmp/profile_%d_pass%d" %
                                        (trainer_id, pass_id))
@@ -246,39 +184,40 @@ def train_parallel(train_args, test_args, args, train_prog, test_prog,
             fetch_list = [avg_loss.name]
             acc_name_list = [v.name for v in train_args[2]]
             fetch_list.extend(acc_name_list)
+            fetch_list.append("learning_rate")
+            if iters % args.log_period == 0:
+                should_print = True
+            else:
+                should_print = False
 
-            if args.use_fake_data or args.use_reader_op:
-                try:
+            fetch_ret = []
+            try:
+                if should_print:
                     fetch_ret = exe.run(fetch_list)
-                except fluid.core.EOFException as eof:
-                    break
-                except fluid.core.EnforceNotMet as ex:
-                    traceback.print_exc()
-                    break
-            else:
-                fetch_ret = exe.run(fetch_list, feed=feeder.feed(data))
-            if args.use_reader_op or args.use_fake_data:
-                num_samples += args.batch_size * args.gpus
-            else:
-                num_samples += len(data)
+                else:
+                    exe.run([])
+            except fluid.core.EOFException as eof:
+                print("Finish current epoch, will reset pyreader...")
+                train_args[4].reset()
+                break
+            except fluid.core.EnforceNotMet as ex:
+                traceback.print_exc()
+                exit(1)
 
-            iters += 1
-            if batch_id % 1 == 0:
+            num_samples += bs * args.gpus
+
+            if should_print:
                 fetched_data = [np.mean(np.array(d)) for d in fetch_ret]
-                print("Pass %d, batch %d, loss %s, accucacys: %s" %
-                      (pass_id, batch_id, fetched_data[0], fetched_data[1:]))
+                print("Pass %d, batch %d, loss %s, accucacys: %s, learning_rate %s" %
+                      (pass_id, iters, fetched_data[0], fetched_data[1:-1], fetched_data[-1]))
                 if args.use_reader_op:
                     print("pyreader queue: ", train_args[4].queue.size())
-            batch_id += 1
+            iters += 1
 
         print_train_time(start_time, time.time(), num_samples)
-        if args.use_reader_op:
-            train_args[4].reset()  # reset reader handle
-        else:
-            del reader_generator
 
         test_ret = test_parallel(test_exe, test_args, args, test_prog,
-                                 None)
+                                 None, bs)
         print("Pass: %d, Test Accuracy: %s\n" %
             (pass_id, [np.mean(np.array(v)) for v in test_ret]))
 
@@ -316,57 +255,13 @@ def main():
     if args.no_random:
         fluid.default_startup_program().random_seed = 1
 
-    # the unique trainer id, starting from 0, needed by trainer
-    # only
-    nccl_id_var, num_trainers, trainer_id = (
-        None, 1, int(os.getenv("PADDLE_TRAINER_ID", "0")))
-
     if args.use_cprof:
         pr = cProfile.Profile()
         pr.enable()
 
-    model_def = __import__("models.%s" % args.model, fromlist=["models"])
-
-    train_prog = fluid.Program()
-    test_prog = fluid.Program()
-    startup_prog = fluid.Program()
-
-    #train_args = list(model_def.get_model(args, True, train_prog, startup_prog, 0))
-    #test_args = list(model_def.get_model(args, False, test_prog, startup_prog, 0))
-    train_args = []
-    test_args = []
-
-
-    all_args = [train_args, test_args, args]
-
-    if args.update_method == "pserver":
-        train_prog, startup_prog = dist_transpile(trainer_id, args, train_prog,
-                                                  startup_prog)
-        if not train_prog:
-            raise Exception(
-                "Must configure correct environments to run dist train.")
-        all_args.extend([train_prog, test_prog, startup_prog])
-        if args.gpus > 1 and os.getenv("PADDLE_TRAINING_ROLE") == "TRAINER":
-            all_args.extend([nccl_id_var, num_trainers, trainer_id])
-            train_parallel(*all_args)
-        elif os.getenv("PADDLE_TRAINING_ROLE") == "PSERVER":
-            # start pserver with Executor
-            server_exe = fluid.Executor(fluid.CPUPlace())
-            server_exe.run(startup_prog)
-            server_exe.run(train_prog)
-        exit(0)
-
-    # for other update methods, use default programs
-    all_args.extend([train_prog, test_prog, startup_prog])
-
-    if args.update_method == "nccl2":
-        nccl_id_var, num_trainers, trainer_id = append_nccl2_prepare(
-            trainer_id, startup_prog)
-
     if args.device == "CPU":
         raise Exception("Only support GPU perf with parallel exe")
-    all_args.extend([nccl_id_var, num_trainers, trainer_id])
-    train_parallel(*all_args)
+    train_parallel(args)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,11 @@ def parse_args():
         type=int,
         default=1,
         help='If gpus > 1, will use ParallelExecutor to run, else use Executor.')
+    parser.add_argument(
+        '--log_period',
+        type=int,
+        default=5,
+        help='print period, defualt is 5')
     # this option is available only for vgg and resnet.
     parser.add_argument(
         '--cpus',
@@ -146,5 +151,14 @@ def parse_args():
         choices=['reduce', 'all_reduce'],
         default='all_reduce',
         help='Specify the reduce strategy, can be reduce, all_reduce')
+    parser.add_argument(
+        '--use_uint8_reader',
+        action='store_true',
+        help='If set, feed image with uint8 data type')
+    parser.add_argument(
+        '--init_conv2d_kaiming',
+        action='store_true',
+        help='If set, use kaiming normal to initialize conv2d.weight')
+
     args = parser.parse_args()
     return args
