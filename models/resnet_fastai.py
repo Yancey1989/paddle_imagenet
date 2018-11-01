@@ -36,27 +36,12 @@ import torchvision_reader
 
 BN_NO_DECAY = bool(os.getenv("BN_NO_DECAY", "1"))
 
-train_parameters = {
-    "input_size": [3, 224, 224],
-    #"input_size": [3, 128, 128],
-    "input_mean": [0.485, 0.456, 0.406],
-    "input_std": [0.229, 0.224, 0.225],
-    "learning_strategy": {
-        "name": "piecewise_decay",
-        "batch_size": 256,
-        "epochs": [30, 60, 90],
-        "steps": [0.1, 0.01, 0.001, 0.0001]
-    }
-}
-
-
 class ResNet():
     def __init__(self, layers=50, is_train=True):
-        self.params = train_parameters
         self.layers = layers
         self.is_train = is_train
 
-    def net(self, input, class_dim=1000):
+    def net(self, input, class_dim=1000, img_size=224):
         layers = self.layers
         supported_layers = [50, 101, 152]
         assert layers in supported_layers, \
@@ -85,14 +70,17 @@ class ResNet():
                     input=conv,
                     num_filters=num_filters[block],
                     stride=2 if i == 0 and block != 0 else 1)
-
+        pool_size = int(img_size / 32)
         pool = fluid.layers.pool2d(
-            input=conv, pool_size=7, pool_type='avg', global_pooling=True)
+            input=conv, pool_size=pool_size, pool_type='avg', global_pooling=True)
         out = fluid.layers.fc(input=pool,
                               size=class_dim,
                               act='softmax',
                               param_attr=fluid.param_attr.ParamAttr(
-                                  initializer=fluid.initializer.NormalInitializer(0.0, 0.01)))
+                                  initializer=fluid.initializer.NormalInitializer(0.0, 0.01),
+                                  regularizer=fluid.regularizer.L2Decay(1e-4)),
+                              bias_attr=fluid.ParamAttr(
+                                  regularizer=fluid.regularizer.L2Decay(1e-4)))
         return out
 
     def conv_bn_layer(self,
@@ -102,7 +90,7 @@ class ResNet():
                       stride=1,
                       groups=1,
                       act=None,
-                      scale=1.0):
+                      bn_init_value=1.0):
         conv = fluid.layers.conv2d(
             input=input,
             num_filters=num_filters,
@@ -111,11 +99,12 @@ class ResNet():
             padding=(filter_size - 1) // 2,
             groups=groups,
             act=None,
-            bias_attr=False)
+            bias_attr=False,
+            param_attr=fluid.ParamAttr(regularizer=fluid.regularizer.L2Decay(1e-4)))
         return fluid.layers.batch_norm(input=conv, act=act, is_test=not self.is_train,
             param_attr=fluid.param_attr.ParamAttr(
-                initializer=fluid.initializer.Constant(scale),
-                regularizer=None if BN_NO_DECAY else fluid.regularizer.L2Decay(1e-4)))
+                initializer=fluid.initializer.Constant(bn_init_value),
+                regularizer=None))
 
     def shortcut(self, input, ch_out, stride):
         ch_in = input.shape[1]
@@ -135,7 +124,7 @@ class ResNet():
             act='relu')
         # init bn-weight0
         conv2 = self.conv_bn_layer(
-            input=conv1, num_filters=num_filters * 4, filter_size=1, act=None, scale=0.0)
+            input=conv1, num_filters=num_filters * 4, filter_size=1, act=None, bn_init_value=0.0)
 
         short = self.shortcut(input, num_filters * 4, stride)
 
@@ -155,7 +144,7 @@ def _model_reader_dshape_classdim(args, is_train, sz=224, rsz=352, min_scale=0.0
                 traindir="/data/imagenet/sz/%d/train" % rsz, sz=sz, min_scale=min_scale, use_uint8_reader=args.use_uint8_reader)
         else:
             reader = torchvision_reader.test(
-                valdir="/data/imagenet/sz/%d/validation" % rsz, bs=32, sz=sz, rect_val=False, use_uint8_reader=args.use_uint8_reader)
+                valdir="/data/imagenet/sz/%d/validation" % rsz, bs=None, sz=sz, rect_val=False, use_uint8_reader=args.use_uint8_reader)
     else:
         raise ValueError("only support imagenet dataset.")
 
@@ -167,7 +156,6 @@ def lr_decay(lrs, epochs, bs, total_image):
     import math
     for idx, epoch in enumerate(epochs):
         step = math.ceil(total_image * 1.0 / (bs[idx] * 8))
-        step = total_image / (bs[idx] * 8)
         ratio = (lrs[idx][1] - lrs[idx][0]) / (epoch[1] - epoch[0])
         lr_base = lrs[idx][0]
         for s in xrange(epoch[0], epoch[1]):
@@ -178,8 +166,6 @@ def lr_decay(lrs, epochs, bs, total_image):
             values.append(lr_base + ratio * (s - epoch[0]))
     values.append(lrs[-1])
     return boundaries, values
-
-
 
 def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, sz, rsz, bs, min_scale):
 
@@ -210,16 +196,16 @@ def get_model(args, is_train, main_prog, startup_prog, py_reader_startup_prog, s
                 cast = fluid.layers.cast(input, "float32")
                 img_mean = fluid.layers.create_global_var([3, 1, 1], 0.0, "float32", name="img_mean", persistable=True)
                 img_std = fluid.layers.create_global_var([3, 1, 1], 0.0, "float32", name="img_std", persistable=True)
-                t1 = cast / 255.0 - img_mean
-                t2 = t1 / img_std
-                #t1 = fluid.layers.elementwise_sub(cast / 255.0, img_mean, axis=1)
-                #t2 = fluid.layers.elementwise_div(t1, img_std, axis=1)
-                #t2 = cast / 255.0 - img_std
+                # elementwise_op would broadcast the parameter
+                # t1 = cast - img_mean.broadcast(batch_size, 3, image_size, image_size)
+                # t2 = t1 / img_std.broadcast(batch_size, 3, image_size, image_size)
+                t1 = fluid.layers.elementwise_sub(cast, img_mean, axis=1)
+                t2 = fluid.layers.elementwise_div(t1, img_std, axis=1)
             else:
                 t2 = input
 
             model = ResNet(is_train=is_train)
-            predict = model.net(t2, class_dim=class_dim)
+            predict = model.net(t2, class_dim=class_dim, img_size=sz)
             cost = fluid.layers.cross_entropy(input=predict, label=label)
             avg_cost = fluid.layers.mean(x=cost)
 

@@ -88,8 +88,8 @@ def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False, min_
                 tensor.set(np.array(kaiming_np, dtype='float32'), place)
         
         if args.use_uint8_reader:
-            img_mean_np = np.array([0.485, 0.456, 0.406]).astype("float32").reshape((3, 1, 1))
-            img_std_np = np.array([0.229, 0.224, 0.225]).astype("float32").reshape((3, 1, 1))
+            img_mean_np = np.array([0.485 * 255, 0.456 * 255, 0.406 * 255]).astype("float32").reshape((3, 1, 1))
+            img_std_np = np.array([0.229 * 255, 0.224 * 255, 0.225 * 255]).astype("float32").reshape((3, 1, 1))
             mean_var = fluid.global_scope().find_var("img_mean")
             mean_var.get_tensor().set(img_mean_np, place)
             std_var = fluid.global_scope().find_var("img_std")
@@ -101,18 +101,6 @@ def refresh_program(args, epoch, sz, rsz, bs, need_update_start_prog=False, min_
         with open('/tmp/test_prog_pass%d' % epoch, 'w') as f: f.write(test_prog.to_string(True))
         with open('/tmp/startup_prog_pass%d' % epoch, 'w') as f: f.write(startup_prog.to_string(True))
         with open('/tmp/py_reader_startup_prog_pass%d' % epoch, 'w') as f: f.write(py_reader_startup_prog.to_string(True))
-        with open('/tmp/train_prog_vars', 'w') as f:
-            for var in train_prog.global_block().vars.values():
-                try:
-                    f.write(var.name + '|' + str(var.shape) + '\n')
-                except Exception,e:
-                    pass
-        with open('/tmp/test_prog_vars', 'w') as f:
-            for var in test_prog.global_block().vars.values():
-                try:
-                    f.write(var.name + '|' + str(var.shape) + '\n')
-                except Exception,e:
-                    pass
 
     strategy = fluid.ExecutionStrategy()
     strategy.num_threads = args.cpus
@@ -208,18 +196,16 @@ def train_parallel(args):
 
             if should_print:
                 fetched_data = [np.mean(np.array(d)) for d in fetch_ret]
-                print("Pass %d, batch %d, loss %s, accucacys: %s, learning_rate %s" %
-                      (pass_id, iters, fetched_data[0], fetched_data[1:-1], fetched_data[-1]))
-                if args.use_reader_op:
-                    print("pyreader queue: ", train_args[4].queue.size())
+                print("Pass %d, batch %d, loss %s, accucacys: %s, learning_rate %s, py_reader queue_size: %d" %
+                      (pass_id, iters, fetched_data[0], fetched_data[1:-1], fetched_data[-1], train_args[4].queue.size()))
             iters += 1
 
         print_train_time(start_time, time.time(), num_samples)
 
         test_ret = test_parallel(test_exe, test_args, args, test_prog,
                                  None, bs)
-        print("Pass: %d, Test Accuracy: %s\n" %
-            (pass_id, [np.mean(np.array(v)) for v in test_ret]))
+        print("Pass: %d, Test Accuracy: %s, Spend %.2f hours\n" %
+            (pass_id, [np.mean(np.array(v)) for v in test_ret], (time.time() - over_all_start) / 3600))
 
     print("total train time: ", time.time() - over_all_start)
 

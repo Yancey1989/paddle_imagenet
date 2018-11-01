@@ -19,7 +19,7 @@ TRAINER_NUMS = int(os.getenv("PADDLE_TRAINER_NUM", "1"))
 TRAINER_ID = int(os.getenv("PADDLE_TRAINER_ID", "0"))
 epoch = 0
 
-def paddle_data_loader(torch_dataset, concurrent=24, queue_size=1024, use_uint8_reader=False):
+def paddle_data_loader(torch_dataset, concurrent=24, queue_size=3072, use_uint8_reader=False):
     data_queue = multiprocessing.Queue(queue_size)
     FINISH_EVENT = "FINISH_EVENT"
 
