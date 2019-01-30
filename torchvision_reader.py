@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 import math
+import random
 import torch
 import torch.utils.data
 from torch.utils.data.distributed import DistributedSampler
@@ -19,72 +20,68 @@ TRAINER_NUMS = int(os.getenv("PADDLE_TRAINER_NUM", "1"))
 TRAINER_ID = int(os.getenv("PADDLE_TRAINER_ID", "0"))
 epoch = 0
 
-def paddle_data_loader(torch_dataset, concurrent=24, queue_size=3072, use_uint8_reader=False):
-    data_queue = multiprocessing.Queue(queue_size)
-    FINISH_EVENT = "FINISH_EVENT"
+FINISH_EVENT = "FINISH_EVENT"
+#def paddle_data_loader(torch_dataset, indices=None, concurrent=1, queue_size=3072, use_uint8_reader=False):
+class PaddleDataLoader(object):
+    def __init__(self, torch_dataset, indices=None, concurrent=16, queue_size=3072):
+        self.torch_dataset = torch_dataset
+        self.data_queue = multiprocessing.Queue(queue_size)
+        self.indices = indices
+        self.concurrent = concurrent
 
-    def _worker_loop(dataset, indices, worker_id):
+    def _worker_loop(self, dataset, worker_indices, worker_id):
         cnt = 0
-        for idx in indices:
+        for idx in worker_indices:
             cnt += 1
-            img, label = torch_dataset[idx]
-            if use_uint8_reader:
-                img = np.array(img).astype('uint8').transpose((2, 0, 1))
-            else:
-                img = np.array(img).astype('float32').transpose((2, 0, 1))
-                mean = [0.485, 0.456, 0.406]
-                std = [0.229, 0.224, 0.225]
-                scale = 1.0 / 255.0
-                img_mean = np.array(mean).reshape((3, 1, 1))
-                img_std = np.array(std).reshape((3, 1, 1))
-                img = (img * scale - img_mean) / img_std
-            data_queue.put((img, label))
+            img, label = self.torch_dataset[idx]
+            img = np.array(img).astype('uint8').transpose((2, 0, 1))
+            self.data_queue.put((img, label))
         print("worker: [%d] read [%d] samples. " % (worker_id, cnt))
-        data_queue.put(FINISH_EVENT)
+        self.data_queue.put(FINISH_EVENT)
 
-    def _reader():
-        worker_processes = []
-        total_img = len(torch_dataset)
-        print("total image: ", total_img)
-        indices = [i for i in xrange(total_img)]
-        import random
-        import math
-        random.seed(time.time())
-        random.shuffle(indices)
-        print("shuffle indices: %s ..." % indices[:10])
+    def reader(self):
+        def _reader_creator():
+            worker_processes = []
+            total_img = len(self.torch_dataset)
+            print("total image: ", total_img)
+            if self.indices is None:
+                self.indices = [i for i in xrange(total_img)]
+                random.seed(time.time())
+                random.shuffle(self.indices)
+                print("shuffle indices: %s ..." % self.indices[:10])
 
-        imgs_per_worker = int(math.ceil(total_img / concurrent))
-        for i in xrange(concurrent):
-            start = i * imgs_per_worker
-            end = (i + 1) * imgs_per_worker if i != concurrent - 1 else None
-            sliced_indices = indices[start:end]
-            w = multiprocessing.Process(
-                target=_worker_loop,
-                args=(torch_dataset, sliced_indices, i)
-            )
-            w.daemon = True
-            w.start()
-            worker_processes.append(w)
-        finish_workers = 0
-        worker_cnt = len(worker_processes)
-        while finish_workers < worker_cnt:
-            sample = data_queue.get()
-            if sample == FINISH_EVENT:
-                finish_workers += 1
-            else:
-                yield sample
+            imgs_per_worker = int(math.ceil(total_img / self.concurrent))
+            for i in xrange(self.concurrent):
+                start = i * imgs_per_worker
+                end = (i + 1) * imgs_per_worker if i != self.concurrent - 1 else None
+                sliced_indices = self.indices[start:end]
+                w = multiprocessing.Process(
+                    target=self._worker_loop,
+                    args=(self.torch_dataset, sliced_indices, i)
+                )
+                w.daemon = True
+                w.start()
+                worker_processes.append(w)
+            finish_workers = 0
+            worker_cnt = len(worker_processes)
+            while finish_workers < worker_cnt:
+                sample = self.data_queue.get()
+                if sample == FINISH_EVENT:
+                    finish_workers += 1
+                else:
+                    yield sample
 
-    return _reader
+        return _reader_creator
 
-def train(traindir, sz, min_scale=0.08, use_uint8_reader=False):
+def train(traindir, sz, min_scale=0.08):
     train_tfms = [
         transforms.RandomResizedCrop(sz, scale=(min_scale, 1.0)),
         transforms.RandomHorizontalFlip()
     ]
     train_dataset = datasets.ImageFolder(traindir, transforms.Compose(train_tfms))
-    return paddle_data_loader(train_dataset, queue_size=1024, use_uint8_reader=use_uint8_reader)
+    return PaddleDataLoader(train_dataset).reader()
 
-def test(valdir, bs, sz, rect_val=False, use_uint8_reader=False):
+def test(valdir, bs, sz, rect_val=False):
     if rect_val:
         idx_ar_sorted = sort_ar(valdir)
         idx_sorted, _ = zip(*idx_ar_sorted)
@@ -92,15 +89,17 @@ def test(valdir, bs, sz, rect_val=False, use_uint8_reader=False):
 
         ar_tfms = [transforms.Resize(int(sz* 1.14)), CropArTfm(idx2ar, sz)]
         val_dataset = ValDataset(valdir, transform=ar_tfms)
-        return paddle_data_loader(val_dataset, use_uint8_reader=use_uint8_reader)
+        return PaddleDataLoader(val_dataset, concurrent=1, indices=idx_sorted).reader()
 
     val_tfms = [transforms.Resize(int(sz* 1.14)), transforms.CenterCrop(sz)]
     val_dataset = datasets.ImageFolder(valdir, transforms.Compose(val_tfms))
-    return paddle_data_loader(val_dataset, use_uint8_reader=use_uint8_reader)
+
+    return PaddleDataLoader(val_dataset).reader()
 
 
 
 def create_validation_set(valdir, batch_size, target_size, rect_val, distributed):
+    print("create_validation_set", valdir, batch_size, target_size, rect_val, distributed)
     if rect_val:
         idx_ar_sorted = sort_ar(valdir)
         idx_sorted, _ = zip(*idx_ar_sorted)
@@ -145,14 +144,14 @@ class DistValSampler(Sampler):
         self.batch_size = batch_size
         if distributed:
             self.world_size = TRAINER_NUMS
-            self.global_rank = TRAINER_NUMS
+            self.global_rank = TRAINER_ID
         else:
             self.global_rank = 0
             self.world_size = 1
 
         # expected number of batches per sample. Need this so each distributed gpu validates on same number of batches.
         # even if there isn't enough data to go around
-        self.expected_num_batches = math.ceil(len(self.indices) / self.world_size / self.batch_size)
+        self.expected_num_batches = int(math.ceil(len(self.indices) / self.world_size / self.batch_size))
 
         # num_samples = total images / world_size. This is what we distribute to each gpu
         self.num_samples = self.expected_num_batches * self.batch_size
@@ -160,6 +159,7 @@ class DistValSampler(Sampler):
     def __iter__(self):
         offset = self.num_samples * self.global_rank
         sampled_indices = self.indices[offset:offset + self.num_samples]
+        print("DistValSampler: self.world_size: ", self.world_size, " self.global_rank: ", self.global_rank)
         for i in range(self.expected_num_batches):
             offset = i * self.batch_size
             yield sampled_indices[offset:offset + self.batch_size]
@@ -193,7 +193,7 @@ def sort_ar(valdir):
     print('Creating AR indexes. Please be patient this may take a couple minutes...')
     val_dataset = datasets.ImageFolder(valdir)  # AS: TODO: use Image.open instead of looping through dataset
     sizes = [img[0].size for img in tqdm(val_dataset, total=len(val_dataset))]
-    idx_ar = [(i, round(s[0] / s[1], 5)) for i, s in enumerate(sizes)]
+    idx_ar = [(i, round(s[0] * 1.0/ s[1], 5)) for i, s in enumerate(sizes)]
     sorted_idxar = sorted(idx_ar, key=lambda x: x[1])
     pickle.dump(sorted_idxar, open(idx2ar_file, 'wb'))
     print('Done')
@@ -215,17 +215,18 @@ def map_idx2ar(idx_ar_sorted, batch_size):
     return idx2ar
 
 if __name__ == "__main__":
-    train_tfms = [
-        transforms.RandomResizedCrop(128, scale=(0.08, 1.0)),
-        transforms.RandomHorizontalFlip()
-    ]
-    train_dataset = datasets.ImageFolder("/data/imagenet/sz/160/train", transforms.Compose(train_tfms))
-    train_reader = paddle_data_loader(train_dataset)
-
+    #ds, sampler = create_validation_set("/data/imagenet/validation", 128, 288, True, True)
+    #for item in sampler:
+    #    for idx in item:
+    #        ds[idx]
 
     import time
+    test_reader = test(valdir="/data/imagenet/validation", bs=50, sz=288, rect_val=True)
     start_ts = time.time()
-    for idx, data in enumerate(train_reader()):
+    for idx, data in enumerate(test_reader()):
+        print(idx, data[0].shape, data[1])
+        if idx == 10:
+            break
         if (idx + 1) % 1000 == 0:
             cost = (time.time() - start_ts)
             print("%d samples per second" % (1000 / cost))
