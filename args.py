@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument(
         '--log_period',
         type=int,
-        default=5,
+        default=30,
         help='print period, defualt is 5')
     # this option is available only for vgg and resnet.
     parser.add_argument(
@@ -151,6 +151,15 @@ def parse_args():
         choices=['reduce', 'all_reduce'],
         default='all_reduce',
         help='Specify the reduce strategy, can be reduce, all_reduce')
+    parser.add_argument(
+        '--fp16',
+        action='store_true',
+        help='FP16 or FP32.')
+    parser.add_argument(
+        '--scale_loss',
+        type=float,
+        default=1024,
+        help="loss scale for fp16 training")
     parser.add_argument(
         '--use_uint8_reader',
         action='store_true',
